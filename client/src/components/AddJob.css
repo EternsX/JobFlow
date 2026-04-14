@@ -1,0 +1,11 @@
+.add-job {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.add-job h1 {
+    font-size: 2rem;
+    margin-bottom: 1rem;
+    color: rgb(190, 206, 241);
+}

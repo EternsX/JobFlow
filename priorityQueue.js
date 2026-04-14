@@ -1,6 +1,7 @@
 import Redis from "ioredis";
 
 class RedisQueue {
+  
   constructor() {
     this.redis = new Redis({
       host: "127.0.0.1",

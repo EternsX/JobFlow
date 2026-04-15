@@ -1,5 +1,8 @@
-import Worker from './worker.js'; // your Worker class
+import Worker from './worker.js';
 
-const worker = new Worker(3); // concurrency = 3
+const worker = new Worker(3);
 
-worker.start(); // 🔥 THIS is what you were missing/confused about
+worker.start();
+
+worker.recoverStuckJobs();
+await worker.waitForIdle();

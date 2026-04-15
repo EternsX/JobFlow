@@ -14,7 +14,7 @@ class Job {
     async perform() {
         console.log(`Performing job: ${this.description}`);
         // simulate random failure
-        if (Math.random() < 0.3) {
+        if (Math.random() < 0.8) {
             throw new Error('Random failure occurred');
         }
         return `Job ${this.id} done`;

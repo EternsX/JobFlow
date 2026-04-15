@@ -36,10 +36,17 @@ class Worker {
       await this.queue.addError(job.id, error.message);
 
       if (job.tries < job.maxRetries) {
-        await this.queue.addJob(job);
-        await this.queue.markDone(job.id, "pending");
+        const delay = 1000 * Math.pow(2, job.tries);
+
+        await this.queue.markDone(job.id, "retry", {
+          lastError: error.message,
+        });
+
+        await this.queue.addJob(job, delay);
       } else {
-        await this.queue.markDone(job.id, "failed");
+        await this.queue.markDone(job.id, "failed", {
+          lastError: error.message,
+        });
       }
     }
   }
@@ -79,9 +86,37 @@ class Worker {
     }
   }
 
+  async waitForIdle() {
+    return new Promise((resolve) => {
+      const interval = setInterval(async () => {
+        if (await this.queue.isIdle()) {
+          console.log("All workers are idle. Shutting down...");
+
+          console.log(await this.queue.getJobsByStatus("completed"));
+          console.log(await this.queue.getJobsByStatus("failed"));
+
+          clearInterval(interval);
+          this.stop();
+          resolve();
+        }
+      }, 2000);
+    });
+  }
+
+  async recoverStuckJobs() {
+    this.recoveryRunning = true;
+
+    while (this.recoveryRunning) {
+      await this.queue.recoverStuckJobs(10000);
+      await delay(10000);
+    }
+  }
+
+
   stop() {
     this.running = false;
     console.log("Stopping workers...");
+    this.queue.clearAll();
   }
 }
 

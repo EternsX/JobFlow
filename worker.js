@@ -11,6 +11,8 @@ class Worker {
     this.running = false;
     this.pollInterval = pollInterval;
     this.concurrency = concurrency;
+    this.heartbeats = new Map();
+    this.activeJobs = new Set();
   }
 
   async addJob(job) {
@@ -20,6 +22,8 @@ class Worker {
 
   async processJob(job, workerId) {
     console.log(`👷 Worker ${workerId} processing ${job.id}`);
+    this.activeJobs.add(job.id);
+    this.startHeartbeat(job.id);
 
     try {
       const result = await job.perform();
@@ -31,23 +35,20 @@ class Worker {
     } catch (error) {
       console.error(`❌ Worker ${workerId} failed ${job.id}`);
 
-      job.tries += 1;
-
       await this.queue.addError(job.id, error.message);
 
+      job.tries += 1;
+
       if (job.tries < job.maxRetries) {
-        const delay = 1000 * Math.pow(2, job.tries);
+        const backoff = 1000 * Math.pow(2, job.tries - 1);
 
-        await this.queue.markDone(job.id, "retry", {
-          lastError: error.message,
-        });
-
-        await this.queue.addJob(job, delay);
+        await this.queue.addJob(job, backoff);
       } else {
-        await this.queue.markDone(job.id, "failed", {
-          lastError: error.message,
-        });
+        await this.queue.markDone(job.id, "failed");
       }
+    } finally {
+      this.activeJobs.delete(job.id);
+      this.stopHeartbeat(job.id);
     }
   }
 
@@ -82,14 +83,20 @@ class Worker {
 
       job.tries = Number(rawJob.tries);
 
-      await this.processJob(job, workerId);
+      try {
+        await this.processJob(job, workerId);
+      } catch (err) {
+        console.error(`Worker ${workerId} crashed job loop`, err);
+      }
     }
   }
 
   async waitForIdle() {
     return new Promise((resolve) => {
       const interval = setInterval(async () => {
-        if (await this.queue.isIdle()) {
+        const idle = await this.queue.isIdle();
+
+        if (idle && this.activeJobs.size === 0) {
           console.log("All workers are idle. Shutting down...");
 
           console.log(await this.queue.getJobsByStatus("completed"));
@@ -103,20 +110,37 @@ class Worker {
     });
   }
 
-  async recoverStuckJobs() {
-    this.recoveryRunning = true;
+  async startHeartbeat(jobId) {
+    const interval = setInterval(async () => {
+      try {
+        const newLease = Date.now() + 10000;
+        await this.queue.extendLease(jobId, newLease);
+      } catch (err) {
+        console.error("Heartbeat failed", err);
+      }
+    }, 3000);
 
-    while (this.recoveryRunning) {
-      await this.queue.recoverStuckJobs(10000);
-      await delay(10000);
-    }
+    this.heartbeats.set(jobId, interval);
   }
 
+  stopHeartbeat(jobId) {
+    const interval = this.heartbeats.get(jobId);
+
+    if (interval) {
+      clearInterval(interval);
+      this.heartbeats.delete(jobId);
+    }
+  }
 
   stop() {
     this.running = false;
     console.log("Stopping workers...");
     this.queue.clearAll();
+
+    for (const [, interval] of this.heartbeats) {
+      clearInterval(interval);
+    }
+    this.heartbeats.clear();
   }
 }
 

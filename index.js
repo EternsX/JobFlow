@@ -4,5 +4,4 @@ const worker = new Worker(3);
 
 worker.start();
 
-worker.recoverStuckJobs();
 await worker.waitForIdle();

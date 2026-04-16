@@ -9,7 +9,6 @@ class RedisQueue {
     });
 
     this.queueKey = "jobs:queue";
-    this.activeKey = "jobs:active";
   }
 
   async addJob(job, delay = 0) {
@@ -37,34 +36,48 @@ class RedisQueue {
   async nextJob() {
     const script = `
       local now = tonumber(redis.call("TIME")[1]) * 1000
+      local leaseUntil = now + 10000
 
-      local res = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", now, "LIMIT", 0, 1)
+      local res = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", now, "LIMIT", 0, 5)
 
-      if #res == 0 then
-        return nil
+      if #res == 0 then return nil end
+
+      for i = 1, #res do
+        local jobId = res[i]
+        local jobKey = ARGV[1] .. jobId
+
+        if redis.call("EXISTS", jobKey) == 0 then
+          redis.call("ZREM", KEYS[1], jobId)
+        else
+          local status = redis.call("HGET", jobKey, "status")
+
+          if status == "completed" or status == "failed" then
+            redis.call("ZREM", KEYS[1], jobId)
+          else
+            local lease = redis.call("HGET", jobKey, "leaseUntil")
+
+            if not lease or tonumber(lease) <= now then
+              redis.call("ZADD", KEYS[1], leaseUntil, jobId)
+
+              redis.call("HSET", jobKey,
+                "status", "processing",
+                "startedAt", tostring(now),
+                "leaseUntil", tostring(leaseUntil)
+              )
+
+              return redis.call("HGETALL", jobKey)
+            end
+          end
+        end
       end
 
-      local jobId = res[1]
-
-      redis.call("ZREM", KEYS[1], jobId)
-
-      local jobKey = ARGV[1] .. jobId
-
-      redis.call("SADD", KEYS[2], jobId)
-
-      redis.call("HSET", jobKey,
-        "status", "processing",
-        "startedAt", tostring(now)
-      )
-
-      return redis.call("HGETALL", jobKey)
+      return nil
     `;
 
     const result = await this.redis.eval(
       script,
-      2,
+      1,
       this.queueKey,
-      this.activeKey,
       "job:"
     );
 
@@ -85,11 +98,9 @@ class RedisQueue {
 
     const pipeline = this.redis.pipeline();
 
-    pipeline.srem(this.activeKey, jobId);
+    pipeline.zrem(this.queueKey, jobId);
 
-    if (status === "completed" || status === "failed") {
-      pipeline.zadd(`jobs:${status}`, now, jobId);
-    }
+    pipeline.zadd(`jobs:${status}`, now, jobId);
 
     pipeline.hset(`job:${jobId}`, {
       status,
@@ -100,13 +111,11 @@ class RedisQueue {
     if (status === "completed") {
       pipeline.hdel(`job:${jobId}`, "lastError");
     }
+    pipeline.hdel(`job:${jobId}`, "leaseUntil");
+
 
 
     await pipeline.exec();
-  }
-
-  async addError(jobId, message) {
-    await this.redis.rpush(`job:${jobId}:errors`, message);
   }
 
   async getJobsByStatus(status) {
@@ -123,61 +132,40 @@ class RedisQueue {
     return results.map(([err, job]) => job);
   }
 
-  async isIdle() {
-    const queueSize = await this.redis.zcard(this.queueKey);
-    const activeSize = await this.redis.scard(this.activeKey);
 
-    return queueSize === 0 && activeSize === 0;
+  async getJob(jobId) {
+    return this.redis.hgetall(`job:${jobId}`);
   }
 
-  async clearAll() {
-    const keys = await this.redis.keys("job:*");
+  async extendLease(jobId, leaseUntil) {
+    const script = `
+    local jobKey = KEYS[1]
+    local queueKey = KEYS[2]
+    local jobId = ARGV[1]
+    local leaseUntil = ARGV[2]
 
-    const pipeline = this.redis.pipeline();
+    local status = redis.call("HGET", jobKey, "status")
 
-    // delete all job hashes + error lists
-    for (const key of keys) {
-      pipeline.del(key);
-    }
+    if status == "completed" or status == "failed" then
+      return 0
+    end
 
-    // delete queue structures
-    pipeline.del(this.queueKey);
-    pipeline.del(this.activeKey);
+    redis.call("ZADD", queueKey, leaseUntil, jobId)
+    redis.call("HSET", jobKey, "leaseUntil", leaseUntil)
 
-    // delete history
-    pipeline.del("jobs:completed");
-    pipeline.del("jobs:failed");
+    return 1
+  `;
 
-    await pipeline.exec();
+    await this.redis.eval(
+      script,
+      2,
+      `job:${jobId}`,
+      this.queueKey,
+      jobId,
+      leaseUntil
+    );
   }
 
-  async recoverStuckJobs(timeout = 10000) {
-    const now = Date.now();
-
-    const activeJobs = await this.redis.smembers(this.activeKey);
-
-    for (const jobId of activeJobs) {
-      const job = await this.redis.hgetall(`job:${jobId}`);
-
-      const startedAt = Number(job.startedAt || 0);
-
-      if (now - startedAt > timeout) {
-        console.log(`Recovering stuck job ${jobId}`);
-
-        // remove from active
-        await this.redis.srem(this.activeKey, jobId);
-
-        // requeue it
-        await this.redis.zadd(
-          this.queueKey,
-          now,
-          jobId
-        );
-
-        await this.redis.hset(`job:${jobId}`, "status", "pending");
-      }
-    }
-  }
 
   async getFlakyJobs() {
     const completedIds = await this.redis.zrange("jobs:completed", 0, -1);
@@ -191,21 +179,56 @@ class RedisQueue {
 
     const results = await pipeline.exec();
 
-    const flakyJobs = [];
+    const jobs = [];
 
-    for (let i = 0; i < results.length; i += 2) {
-      const job = results[i][1];
-      const errorCount = results[i + 1][1];
+    for (let i = 0; i < completedIds.length; i++) {
+      const job = results[i * 2][1];
+      const errorCount = results[i * 2 + 1][1];
 
       if (Number(errorCount) > 0) {
-        flakyJobs.push({
-          ...job,
-          errorCount
-        });
+        jobs.push({ ...job, errorCount });
       }
     }
 
-    return flakyJobs;
+    return jobs;
+  }
+
+  async isIdle() {
+    const totalJobs = await this.redis.zcard(this.queueKey);
+
+    return totalJobs === 0;
+  }
+
+  async addError(jobId, message) {
+    const pipeline = this.redis.pipeline();
+
+    pipeline.rpush(`job:${jobId}:errors`, message);
+    pipeline.hset(`job:${jobId}`, {
+      lastError: message,
+    });
+
+    await pipeline.exec();
+  }
+
+
+  async clearAll() {
+    const keys = await this.redis.keys("job:*");
+
+    const pipeline = this.redis.pipeline();
+
+    // delete all job hashes + error lists
+    for (const key of keys) {
+      pipeline.del(key);
+    }
+
+    // delete queue structures
+    pipeline.del(this.queueKey);
+
+    // delete history
+    pipeline.del("jobs:completed");
+    pipeline.del("jobs:failed");
+
+    await pipeline.exec();
   }
 
 }

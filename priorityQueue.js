@@ -1,7 +1,7 @@
 import Redis from "ioredis";
 
 const PRIORITY_FACTOR = 1000;
-const DEFAULT_LEASE_MS = 10000;
+const LEASE_MS = 10000;
 const JOB_TTL_SEC = 3600;
 
 class RedisQueue {
@@ -17,6 +17,7 @@ class RedisQueue {
       errors: (id) => `jobs:${id}:errors`,
       completed: "jobs:completed",
       failed: "jobs:failed",
+      rate: "rate:jobs"
     };
   }
 
@@ -56,32 +57,36 @@ class RedisQueue {
 
   async nextJob() {
     const script = `
-      local now = tonumber(redis.call("TIME")[1]) * 1000
+    local now = tonumber(redis.call("TIME")[1]) * 1000
 
-      local res = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", now, "LIMIT", 0, 10)
-      if #res == 0 then return nil end
+    local res = redis.call("ZRANGEBYSCORE", KEYS[1], "-inf", now, "LIMIT", 0, 10)
+    if #res == 0 then return nil end
 
-      for i = 1, #res do
-        local jobId = res[i]
-        local jobKey = ARGV[1] .. jobId
+    for i = 1, #res do
+      local jobId = res[i]
+      local jobKey = ARGV[1] .. jobId
 
-        -- remove missing jobs
-        if redis.call("EXISTS", jobKey) == 0 then
+      -- remove missing jobs
+      if redis.call("EXISTS", jobKey) == 0 then
+        redis.call("ZREM", KEYS[1], jobId)
+
+      else
+        local status = redis.call("HGET", jobKey, "status")
+
+        -- remove finished jobs
+        if status == "completed" or status == "failed" then
           redis.call("ZREM", KEYS[1], jobId)
 
         else
-          local status = redis.call("HGET", jobKey, "status")
-
-          -- remove finished jobs
-          if status == "completed" or status == "failed" then
-            redis.call("ZREM", KEYS[1], jobId)
+          local nextAttempt = redis.call("HGET", jobKey, "nextAttemptAt")
+          if nextAttempt and tonumber(nextAttempt) > now then
 
           else
             local lease = redis.call("HGET", jobKey, "leaseUntil")
 
             -- claim job if lease expired
             if not lease or tonumber(lease) <= now then
-              local leaseUntil = now + ${DEFAULT_LEASE_MS}
+              local leaseUntil = now + ${LEASE_MS}
 
               redis.call("ZADD", KEYS[1], leaseUntil, jobId)
 
@@ -96,9 +101,10 @@ class RedisQueue {
           end
         end
       end
+    end
 
-      return nil
-    `;
+    return nil
+  `;
 
     const result = await this.redis.eval(
       script,
@@ -123,6 +129,38 @@ class RedisQueue {
     );
 
     return normalized;
+  }
+
+  async canProcessJob(max, duration) {
+    const script = `
+      local key = KEYS[1]
+      local max = tonumber(ARGV[1])
+      local duration = tonumber(ARGV[2])
+      local now = tonumber(ARGV[3])
+
+      redis.call("ZREMRANGEBYSCORE", key, "-inf", now - duration)
+
+      local count = redis.call("ZCARD", key)
+
+      if count < max then
+        redis.call("ZADD", key, now, now .. "-" .. math.random())
+        redis.call("PEXPIRE", key, duration)
+        return 1
+      else
+        return 0
+      end
+    `;
+
+    const result = await this.redis.eval(
+      script,
+      1,
+      this.keys.rate,
+      max,
+      duration,
+      Date.now()
+    );
+
+    return result === 1;
   }
 
   async markDone(jobId, status = "completed", extra = {}) {
@@ -166,6 +204,88 @@ class RedisQueue {
   async getJob(jobId) {
     const job = await this.redis.hgetall(this.keys.job(jobId));
     return this.normalizeJob(job);
+  }
+
+  async requeueJob(job, delay = 0) {
+    const pipeline = this.redis.pipeline();
+
+    const runAt = Date.now() + delay;
+    const score = runAt - (job.priority || 0) * 1000;
+
+    pipeline.zadd(this.keys.queue, score, job.id);
+
+    pipeline.hset(this.keys.job(job.id), {
+      status: "pending",
+      nextAttemptAt: runAt
+    });
+
+    pipeline.hdel(this.keys.job(job.id), "leaseUntil");
+
+    await pipeline.exec();
+  }
+
+  async recoverStuckJobs() {
+    const now = Date.now();
+
+    const jobIds = await this.redis.zrangebyscore(
+      this.keys.queue,
+      "-inf",
+      now
+    );
+
+    // batch fetch
+    const pipeline = this.redis.pipeline();
+    jobIds.forEach((id) => {
+      pipeline.hgetall(this.keys.job(id));
+    });
+
+    const results = await pipeline.exec();
+
+    for (let i = 0; i < jobIds.length; i++) {
+      const jobId = jobIds[i];
+      const [err, job] = results[i];
+      if (err) {
+        console.error("Recover fetch error", err);
+        continue;
+      }
+
+      if (!job || Object.keys(job).length === 0) {
+        await this.redis.zrem(this.keys.queue, jobId);
+        continue;
+      }
+
+      if (job.status !== "processing") continue;
+
+      const leaseUntil = Number(job.leaseUntil || 0);
+      if (leaseUntil > now) continue;
+
+      console.log(`⚠️ Recovering stuck job ${jobId}`);
+
+      const tries = Number(job.tries) + 1;
+      const maxRetries = Number(job.maxRetries);
+
+      await this.addError(jobId, "Worker crashed / lease expired");
+      await this.redis.hdel(this.keys.job(jobId), "leaseUntil");
+
+      if (tries < maxRetries) {
+        const backoff = 1000 * Math.pow(2, tries - 1);
+
+        await this.addJob(
+          {
+            id: jobId,
+            description: job.description,
+            tries,
+            maxRetries,
+            priority: job.priority,
+          },
+          backoff
+        );
+      } else {
+        await this.markDone(jobId, "failed", {
+          lastError: "Worker crashed / lease expired",
+        });
+      }
+    }
   }
 
   async extendLease(jobId, leaseUntil) {
@@ -223,66 +343,6 @@ class RedisQueue {
     return jobs;
   }
 
-  async recoverStuckJobs() {
-    const now = Date.now();
-
-    const jobIds = await this.redis.zrangebyscore(
-      this.keys.queue,
-      "-inf",
-      now
-    );
-
-    // batch fetch
-    const pipeline = this.redis.pipeline();
-    jobIds.forEach((id) => {
-      pipeline.hgetall(this.keys.job(id));
-    });
-
-    const results = await pipeline.exec();
-
-    for (let i = 0; i < jobIds.length; i++) {
-      const jobId = jobIds[i];
-      const job = results[i][1];
-
-      if (!job || Object.keys(job).length === 0) {
-        await this.redis.zrem(this.keys.queue, jobId);
-        continue;
-      }
-
-      if (job.status !== "processing") continue;
-
-      const leaseUntil = Number(job.leaseUntil || 0);
-      if (leaseUntil > now) continue;
-
-      console.log(`⚠️ Recovering stuck job ${jobId}`);
-
-      const tries = Number(job.tries) + 1;
-      const maxRetries = Number(job.maxRetries);
-
-      await this.addError(jobId, "Worker crashed / lease expired");
-      await this.redis.hdel(this.keys.job(jobId), "leaseUntil");
-
-      if (tries < maxRetries) {
-        const backoff = 1000 * Math.pow(2, tries - 1);
-
-        await this.addJob(
-          {
-            id: jobId,
-            description: job.description,
-            tries,
-            maxRetries,
-            priority: job.priority,
-          },
-          backoff
-        );
-      } else {
-        await this.markDone(jobId, "failed", {
-          lastError: "Worker crashed / lease expired",
-        });
-      }
-    }
-  }
-
   async isIdle() {
     const totalJobs = await this.redis.zcard(this.keys.queue);
     return totalJobs === 0;
@@ -300,7 +360,6 @@ class RedisQueue {
   }
 
   async clearAll() {
-    // WARNING: KEYS is blocking — safe for dev only
     const keys = await this.redis.keys("jobs:*");
 
     const pipeline = this.redis.pipeline();

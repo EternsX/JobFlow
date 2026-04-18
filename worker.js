@@ -16,6 +16,11 @@ class Worker {
     this.concurrency = concurrency;
     this.heartbeats = new Map();
     this.activeJobs = new Set();
+
+    this.rateLimit = {
+      max: 5,        // max jobs
+      duration: 1000 // per 1 second
+    };
   }
 
   async addJob(job) {
@@ -79,6 +84,22 @@ class Worker {
           await delay(this.pollInterval);
           continue;
         }
+
+        const allowed = await this.queue.canProcessJob(
+          this.rateLimit.max,
+          this.rateLimit.duration
+        );
+
+        if (!allowed) {
+          // requeue with small delay
+          console.log(`⏱️ Rate limit hit, requeuing ${rawJob.id}`);
+          const base = this.rateLimit.duration;
+          const jitter = Math.random() * 200;
+
+          await this.queue.requeueJob(rawJob, base + jitter);
+          await delay(this.pollInterval);
+          continue;
+        } 1
 
         const job = new Job(
           rawJob.id,

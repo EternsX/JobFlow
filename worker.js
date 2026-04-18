@@ -5,6 +5,9 @@ function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+const LEASE_MS = 10000;
+const HEARTBEAT_INTERVAL = 3000;
+
 class Worker {
   constructor(concurrency = 3, pollInterval = 500) {
     this.queue = new RedisQueue();
@@ -37,11 +40,11 @@ class Worker {
 
       await this.queue.addError(job.id, error.message);
 
-      job.tries += 1;
+      const tries = job.tries + 1;
+      job.tries = tries;
 
-      if (job.tries < job.maxRetries) {
-        const backoff = 1000 * Math.pow(2, job.tries - 1);
-
+      if (tries < job.maxRetries) {
+        const backoff = 1000 * Math.pow(2, tries - 1);
         await this.queue.addJob(job, backoff);
       } else {
         await this.queue.markDone(job.id, "failed");
@@ -58,6 +61,8 @@ class Worker {
 
     console.log(`Starting ${this.concurrency} workers...`);
 
+    this.startRecovery();
+
     for (let i = 0; i < this.concurrency; i++) {
       this.workerLoop(i + 1);
     }
@@ -67,26 +72,27 @@ class Worker {
     console.log(`Worker ${workerId} started`);
 
     while (this.running) {
-      const rawJob = await this.queue.nextJob();
-
-      if (!rawJob) {
-        await delay(this.pollInterval);
-        continue;
-      }
-
-      const job = new Job(
-        rawJob.id,
-        rawJob.description,
-        Number(rawJob.maxRetries),
-        Number(rawJob.priority)
-      );
-
-      job.tries = Number(rawJob.tries);
-
       try {
+        const rawJob = await this.queue.nextJob();
+
+        if (!rawJob) {
+          await delay(this.pollInterval);
+          continue;
+        }
+
+        const job = new Job(
+          rawJob.id,
+          rawJob.description,
+          Number(rawJob.maxRetries),
+          Number(rawJob.priority)
+        );
+
+        job.tries = Number(rawJob.tries);
+
         await this.processJob(job, workerId);
       } catch (err) {
         console.error(`Worker ${workerId} crashed job loop`, err);
+        await delay(this.pollInterval); // prevent tight error loop
       }
     }
   }
@@ -113,12 +119,12 @@ class Worker {
   async startHeartbeat(jobId) {
     const interval = setInterval(async () => {
       try {
-        const newLease = Date.now() + 10000;
+        const newLease = Date.now() + LEASE_MS;
         await this.queue.extendLease(jobId, newLease);
       } catch (err) {
         console.error("Heartbeat failed", err);
       }
-    }, 3000);
+    }, HEARTBEAT_INTERVAL);
 
     this.heartbeats.set(jobId, interval);
   }
@@ -132,10 +138,29 @@ class Worker {
     }
   }
 
-  stop() {
+  startRecovery() {
+    this.recoveryRunning = true;
+
+    this.recoveryInterval = setInterval(async () => {
+      try {
+        await this.queue.recoverStuckJobs();
+      } catch (err) {
+        console.error("Recovery failed", err);
+      }
+    }, 5000);
+  }
+
+  stop({ clear = false } = {}) {
     this.running = false;
+    this.recoveryRunning = false;
+
+    clearInterval(this.recoveryInterval);
+
     console.log("Stopping workers...");
-    this.queue.clearAll();
+
+    if (clear && process.env.NODE_ENV !== "production") {
+      this.queue.clearAll();
+    }
 
     for (const [, interval] of this.heartbeats) {
       clearInterval(interval);

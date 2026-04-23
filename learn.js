@@ -40,57 +40,58 @@ class RedisQueue {
 
     async nextJob(max, duration) {
         const script = `
-            local queueKey = KEYS[1];
-            local rateKey = KEYS[2];
-            local jobPre = ARGS[1];
-            local max = ARGS[2];
-            local duration = ARGS[3];
+            local queueKey = KEYS[1]
+            local rateKey = KEYS[2]
+            local jobPrefix = ARGV[1]
+            local max = tonumber(ARGV[2])
+            local duration = tonumber(ARGV[3])
+            local leaseMs = tonumber(ARGV[4])
 
-            local now = tonumber(redis.call('TIME')[1]) * 1000;
+            local t = redis.call("TIME")
+            local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 
-            redis.call('ZREMRANGEBYSCORE', rateKey, '-inf', now - duration);
+            redis.call('ZREMRANGEBYSCORE', rateKey, '-inf', now - duration)
+            
             local count = redis.call('ZCARD', rateKey)
-
             if count >= max then
-                return nil
+            return nil
             end
 
-            local res = redis.call('ZRANGEBYSCORE', queueKey, '-inf', now, 'LIMIT', 0, 10);
+            local jobs = redis.call('ZRANGEBYSCORE', queueKey, '-inf', now, 'LIMIT', 0, 1)
+            local jobId = jobs[1]
 
-            for i = 1, #res do
-                local jobId = res[i];
-                local jobKey = jobPre .. jobId;
+            if not jobId then
+            return nil
+            end
 
-                if redis.call('EXISTS', jobKey) == 0 then
-                    redis.call('ZREM', queueKey, jobId);
-                else
-                    local status = redis.call('HGET', jobKey, 'status');
+            local jobKey = jobPrefix .. jobId
+            if redis.call('EXISTS', jobKey) == 0 then
+            redis.call('ZREM', queueKey, jobId)
+            return nil
+            end
 
-                    if status == 'completed' or status == 'failed' then
-                        redis.call('ZREM', queueKey, jobId);
-                    else
-                        local lease = redis.call('HGET', jobKey, 'leaseUntil');
+            local status = redis.call('HGET', jobKey, 'status')
+            if status == 'completed' or status == 'failed' then
+            redis.call('ZREM', queueKey, jobId)
+            return nil
+            end
 
-                        if not lease or lease <= now then
+            local leaseUntil = redis.call('HGET', jobKey, 'leaseUntil')
+            if leaseUntil and tonumber(leaseUntil) > now then
+            return nil
+            end
 
-                            local leaseUntil = now + ${LEASE_MS};
+            local newLease = now + leaseMs
+            redis.call('HSET', jobKey, 
+                "status", "processing",
+                "leaseUntil", tostring(newLease),
+                "startedAt", tostring(now)
+            )
 
-                            redis.call('ZADD', queueKey, leaseUntil, jobId);
-                            redis.call('HSET', jobKey, 
-                                'status', 'processing',
-                                'startedAt', tostring(now),
-                                'leaseUntil', tostring(leaseUntil)
-                            )
+            redis.call("ZADD", queueKey, newLease, jobId)
+            redis.call("ZADD", rateKey, now, tostring(now) .. '-' .. tostring(math.random()))
 
-                            redis.call('ZADD', rateKey, now, now .. '-' .. math.random());
-                            redis.call('PEXPIRE', rateKey, duration);
-
-                            return redis.call('HGETALL', jobKey);
-                        end
-                    end
-                end
-            end  
-            return nil          
+            return redis.call("HGETALL", jobKey)
         `;
 
         const result = await this.redis.eval(
@@ -100,7 +101,8 @@ class RedisQueue {
             this.keys.rate,
             "jobs:",
             max,
-            duration
+            duration,
+            LEASE_MS
         );
 
         if (!result) return null;

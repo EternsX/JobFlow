@@ -61,62 +61,59 @@ class RedisQueue {
 
   async nextJob(max, duration) {
     const script = `
-    local queueKey = KEYS[1]
-    local rateKey = KEYS[2]
-    local jobPrefix = ARGV[1]
+            local queueKey = KEYS[1]
+            local rateKey = KEYS[2]
+            local jobPrefix = ARGV[1]
+            local max = tonumber(ARGV[2])
+            local duration = tonumber(ARGV[3])
+            local leaseMs = tonumber(ARGV[4])
 
-    local max = tonumber(ARGV[2])
-    local duration = tonumber(ARGV[3])
-    local leaseMs = tonumber(ARGV[4])
+            local t = redis.call("TIME")
+            local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 
-    local t = redis.call("TIME")
-    local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+            redis.call('ZREMRANGEBYSCORE', rateKey, '-inf', now - duration)
+            
+            local count = redis.call('ZCARD', rateKey)
+            if count >= max then
+            return nil
+            end
 
-    redis.call("ZREMRANGEBYSCORE", rateKey, "-inf", now - duration)
-    local count = redis.call("ZCARD", rateKey)
+            local jobs = redis.call('ZRANGEBYSCORE', queueKey, '-inf', now, 'LIMIT', 0, 1)
+            local jobId = jobs[1]
 
-    if count >= max then
-      return { "RATE_LIMITED" }
-    end
+            if not jobId then
+            return nil
+            end
 
-    local jobs = redis.call("ZRANGEBYSCORE", queueKey, "-inf", now, "LIMIT", 0, 10)
+            local jobKey = jobPrefix .. jobId
+            if redis.call('EXISTS', jobKey) == 0 then
+            redis.call('ZREM', queueKey, jobId)
+            return nil
+            end
 
-    for i = 1, #jobs do
-      local jobId = jobs[i]
-      local jobKey = jobPrefix .. jobId
+            local status = redis.call('HGET', jobKey, 'status')
+            if status == 'completed' or status == 'failed' then
+            redis.call('ZREM', queueKey, jobId)
+            return nil
+            end
 
-      if redis.call("EXISTS", jobKey) == 0 then
-        redis.call("ZREM", queueKey, jobId)
+            local leaseUntil = redis.call('HGET', jobKey, 'leaseUntil')
+            if leaseUntil and tonumber(leaseUntil) > now then
+            return nil
+            end
 
-      else
-        local status = redis.call("HGET", jobKey, "status")
-
-        if status == "completed" or status == "failed" then
-          redis.call("ZREM", queueKey, jobId)
-
-        else
-          local leaseUntil = redis.call("HGET", jobKey, "leaseUntil")
-
-          if not leaseUntil or tonumber(leaseUntil) <= now then
             local newLease = now + leaseMs
-
-            redis.call("HSET", jobKey,
-              "status", "processing",
-              "startedAt", tostring(now),
-              "leaseUntil", tostring(newLease)
+            redis.call('HSET', jobKey, 
+                "status", "processing",
+                "leaseUntil", tostring(newLease),
+                "startedAt", tostring(now)
             )
 
             redis.call("ZADD", queueKey, newLease, jobId)
-            redis.call("ZADD", rateKey, now, now .. "-" .. math.random())
+            redis.call("ZADD", rateKey, now, tostring(now) .. '-' .. tostring(math.random()))
 
             return redis.call("HGETALL", jobKey)
-          end
-        end
-      end
-    end
-
-    return nil
-    `;
+        `;
 
     const result = await this.redis.eval(
       script,
@@ -182,12 +179,12 @@ class RedisQueue {
     return this.normalizeJob(job);
   }
 
-  async extendLease(jobId, leaseUntil) {
+  async extendLease(jobId) {
     const script = `
       local jobKey = KEYS[1]
       local queueKey = KEYS[2]
       local jobId = ARGV[1]
-      local leaseUntil = tonumber(ARGV[2])
+      local leaseMs = tonumber(ARGV[2])
 
       local t = redis.call("TIME")
       local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
@@ -196,8 +193,9 @@ class RedisQueue {
       if status ~= "processing" then return 0 end
 
       local currentLease = redis.call("HGET", jobKey, "leaseUntil")
-      if not currentLease or tonumber(currentLease) < now then return 0 end
+      if not currentLease or tonumber(currentLease) <= now then return 0 end
 
+      local leaseUntil = now + leaseMs
       redis.call("ZADD", queueKey, leaseUntil, jobId)
       redis.call("HSET", jobKey, "leaseUntil", leaseUntil)
 
@@ -210,7 +208,7 @@ class RedisQueue {
       this.keys.job(jobId),
       this.keys.queue,
       jobId,
-      leaseUntil
+      LEASE_MS
     );
   }
 

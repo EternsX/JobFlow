@@ -1,4 +1,4 @@
-import RedisQueue from "./priorityQueue.js";
+import RedisQueue from "./redisQueue.js";
 import Job from "./job.js";
 
 function delay(ms) {
@@ -10,7 +10,6 @@ function log(...args) {
   console.log(`[${now}]`, ...args);
 }
 
-const LEASE_MS = 10000;
 const HEARTBEAT_INTERVAL = 3000;
 
 class Worker {
@@ -147,8 +146,7 @@ class Worker {
       if (!this.activeJobs.has(jobId)) return;
 
       try {
-        const newLease = Date.now() + LEASE_MS;
-        await this.queue.extendLease(jobId, newLease);
+        await this.queue.extendLease(jobId);
       } catch (err) {
         console.error("Heartbeat failed", err);
       }

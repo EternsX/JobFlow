@@ -1,4 +1,4 @@
-import RedisQueue from './priorityQueue.js';
+import RedisQueue from './redisQueue.js';
 import Job from './job.js';
 
 const queue = new RedisQueue();

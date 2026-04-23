@@ -5,6 +5,11 @@ function delay(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+function log(...args) {
+  const now = new Date().toISOString().slice(11, 23);
+  console.log(`[${now}]`, ...args);
+}
+
 const LEASE_MS = 10000;
 const HEARTBEAT_INTERVAL = 3000;
 
@@ -18,8 +23,8 @@ class Worker {
     this.activeJobs = new Set();
 
     this.rateLimit = {
-      max: 5,        // max jobs
-      duration: 1000 // per 1 second
+      max: 5,
+      duration: 1000,
     };
   }
 
@@ -29,7 +34,9 @@ class Worker {
   }
 
   async processJob(job, workerId) {
-    console.log(`👷 Worker ${workerId} processing ${job.id}`);
+    if (!job || !job.id) return;
+
+    log(`Worker ${workerId} processing ${job.id}`);
     this.activeJobs.add(job.id);
     this.startHeartbeat(job.id);
 
@@ -50,7 +57,17 @@ class Worker {
 
       if (tries < job.maxRetries) {
         const backoff = 1000 * Math.pow(2, tries - 1);
-        await this.queue.addJob(job, backoff);
+
+        await this.queue.addJob(
+          {
+            id: job.id,
+            description: job.description,
+            tries: job.tries,
+            maxRetries: job.maxRetries,
+            priority: job.priority,
+          },
+          backoff
+        );
       } else {
         await this.queue.markDone(job.id, "failed");
       }
@@ -66,8 +83,6 @@ class Worker {
 
     console.log(`Starting ${this.concurrency} workers...`);
 
-    this.startRecovery();
-
     for (let i = 0; i < this.concurrency; i++) {
       this.workerLoop(i + 1);
     }
@@ -78,42 +93,35 @@ class Worker {
 
     while (this.running) {
       try {
-        const rawJob = await this.queue.nextJob();
+        const rawJob = await this.queue.nextJob(
+          this.rateLimit.max,
+          this.rateLimit.duration
+        );
 
         if (!rawJob) {
           await delay(this.pollInterval);
           continue;
         }
 
-        const allowed = await this.queue.canProcessJob(
-          this.rateLimit.max,
-          this.rateLimit.duration
-        );
-
-        if (!allowed) {
-          // requeue with small delay
-          console.log(`⏱️ Rate limit hit, requeuing ${rawJob.id}`);
-          const base = this.rateLimit.duration;
+        if (rawJob.rateLimited) {
           const jitter = Math.random() * 200;
-
-          await this.queue.requeueJob(rawJob, base + jitter);
-          await delay(this.pollInterval);
+          await delay(this.pollInterval + jitter);
           continue;
-        } 1
+        }
 
         const job = new Job(
           rawJob.id,
           rawJob.description,
-          Number(rawJob.maxRetries),
-          Number(rawJob.priority)
+          rawJob.maxRetries,
+          rawJob.priority
         );
 
-        job.tries = Number(rawJob.tries);
+        job.tries = rawJob.tries;
 
         await this.processJob(job, workerId);
       } catch (err) {
         console.error(`Worker ${workerId} crashed job loop`, err);
-        await delay(this.pollInterval); // prevent tight error loop
+        await delay(this.pollInterval);
       }
     }
   }
@@ -126,9 +134,6 @@ class Worker {
         if (idle && this.activeJobs.size === 0) {
           console.log("All workers are idle. Shutting down...");
 
-          console.log(await this.queue.getJobsByStatus("completed"));
-          console.log(await this.queue.getJobsByStatus("failed"));
-
           clearInterval(interval);
           this.stop();
           resolve();
@@ -139,6 +144,8 @@ class Worker {
 
   async startHeartbeat(jobId) {
     const interval = setInterval(async () => {
+      if (!this.activeJobs.has(jobId)) return;
+
       try {
         const newLease = Date.now() + LEASE_MS;
         await this.queue.extendLease(jobId, newLease);
@@ -159,23 +166,8 @@ class Worker {
     }
   }
 
-  startRecovery() {
-    this.recoveryRunning = true;
-
-    this.recoveryInterval = setInterval(async () => {
-      try {
-        await this.queue.recoverStuckJobs();
-      } catch (err) {
-        console.error("Recovery failed", err);
-      }
-    }, 5000);
-  }
-
   stop({ clear = false } = {}) {
     this.running = false;
-    this.recoveryRunning = false;
-
-    clearInterval(this.recoveryInterval);
 
     console.log("Stopping workers...");
 
@@ -186,6 +178,7 @@ class Worker {
     for (const [, interval] of this.heartbeats) {
       clearInterval(interval);
     }
+
     this.heartbeats.clear();
   }
 }

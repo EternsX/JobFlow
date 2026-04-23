@@ -16,7 +16,7 @@ async function createJobs() {
         console.log(`➕ Added ${job.id}`);
     }
 
-    await queue.redis.quit(); // 🔥 CLOSE CONNECTION
+    await queue.redis.quit();
 }
 
 createJobs();

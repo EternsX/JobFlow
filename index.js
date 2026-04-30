@@ -4,4 +4,5 @@ const worker = new Worker(3);
 
 worker.start();
 
-await worker.waitForIdle();
+await worker.awaitIdle();
+await worker.shutDown();

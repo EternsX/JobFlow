@@ -40,8 +40,7 @@ class Worker {
       const result = await job.execute();
 
       if (result.ok) {
-        const res = await this.queue.markDone(job.id, workerId, states.COMPLETED);
-        if (!res.ok) return res;
+        await this.queue.markDone(job.id, workerId, states.COMPLETED);
 
         console.log(`OOOOO -> Worker ${workerId} completed Job ${job.id}`);
         return { ok: true };
@@ -49,30 +48,35 @@ class Worker {
 
       console.log(`XXXXX -> Worker ${workerId} failed Job ${job.id} -> ${result.error}`);
 
+      await this.queue.addError(job.id, result.error);
+
+
       job.incrementTries();
 
       if (!job.canRetry()) {
-        const res = await this.queue.markDone(job.id, workerId, states.FAILED);
-        if (!res.ok) return res;
+        await this.queue.moveToDLQ(job.id, workerId, result.error);
 
         return { ok: false, error: result.error };
       }
 
-      const backoffDelay  = job.getBackoffDelay();
-      await this.queue.addJob(job.toDTO(), backoffDelay );
+      const backoffDelay = job.getBackoffDelay();
+      await this.queue.addJob(job.toDTO(), backoffDelay);
 
-      return { ok: false, retry: true };
+      return { ok: false, error: result.error };
 
     } catch (err) {
       console.error(`SYSTEM ERROR Worker ${workerId} Job ${job.id}:`, err.message);
 
       try {
-        await this.queue.markDone(job.id, workerId, states.FAILED);
+        const res = await this.queue.moveToDLQ(job.id, workerId, err.message);
+        if (!res.ok) {
+          console.error(`Failed to mark job as failed:`, res.error);
+        }
       } catch (e) {
         console.error('Failed to mark job as failed:', e.message);
       }
 
-      return { ok: false, systemError: true, error: err.message };
+      return { ok: false, error: err.message };
 
     } finally {
       this.activeJobs.delete(job.id);
@@ -85,18 +89,20 @@ class Worker {
     this.activeWorkers.add(workerId)
 
     while (this.active) {
-      const res = await this.queue.nextJob(workerId, this.rate);
-      if (!res.ok) {
-        workerLoopSwitch(res, POLL_INTERVAL, delay)
-        continue;
-      }
+      try {
+        const res = await this.queue.nextJob(workerId, this.rate);
+        if (!res.ok) {
+          await workerLoopSwitch(res, POLL_INTERVAL, delay)
+          continue;
+        }
 
-      const rawJob = res.rawJob;
+        const rawJob = res.rawJob;
 
-      const job = Job.from(rawJob);
-      const result = await this.processJob(job, workerId);
-      if (!result.ok) {
-        console.log(`Worker: ${workerId}, job: ${job.id} -> `, result.error)
+        const job = Job.from(rawJob);
+        const result = await this.processJob(job, workerId);
+      } catch (err) {
+        console.error(`Worker ${workerId} encountered an error:`, err);
+        await delay(POLL_INTERVAL);
       }
     }
 
@@ -105,26 +111,37 @@ class Worker {
   }
 
   async awaitIdle() {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       const interval = setInterval(async () => {
-        const isIdle = await this.queue.isIdle();
+        try {
+          const isIdle = await this.queue.isIdle();
 
-        if (isIdle && this.activeJobs.size === 0) {
-          console.log('All workers stopped shutting down process...')
+          if (isIdle && this.activeJobs.size === 0) {
+            console.log('All workers stopped shutting down process...');
 
+            clearInterval(interval);
+            this.stop();
+
+            resolve();
+          }
+
+        } catch (err) {
           clearInterval(interval);
-          this.stop();
-          resolve();
+          reject(err);
         }
-      }, POLL_INTERVAL)
-    })
+
+      }, POLL_INTERVAL);
+    });
   }
 
   async startHeartbeat(jobId, workerId) {
     const interval = setInterval(async () => {
       if (!this.activeJobs.has(jobId)) return;
       try {
-        await this.queue.extendLease(jobId, workerId);
+        const res = await this.queue.extendLease(jobId, workerId);
+        if (!res.ok) {
+          console.error("Heartbeat failed", res.error);
+        }
       } catch (err) {
         console.error("Heartbeat failed", err);
       }

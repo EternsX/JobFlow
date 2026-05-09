@@ -1,6 +1,6 @@
 import Redis from "ioredis";
-import { nextJobScript, markDoneScript, extendLeaseScript } from "./luaScripts";
-import { PRIORITY_FACTOR, EXPIRE_MS, LEASE_MS, states } from "./constants";
+import { nextJobScript, markDoneScript, extendLeaseScript } from "./luaScripts.js";
+import { PRIORITY_FACTOR, EXPIRE_MS, LEASE_MS, states } from "./constants.js";
 
 class RedisQueue {
   constructor() {
@@ -14,9 +14,9 @@ class RedisQueue {
       job: (id) => `job:${id}`,
       jobPrefix: 'job:',
       completed: 'jobs:completed',
-      failed: 'jobs:failed',
       errors: (id) => `jobs:${id}:errors`,
-      rate: 'jobs:rate'
+      rate: 'jobs:rate',
+      dlq: 'jobs:dlq',
     }
   }
 
@@ -107,6 +107,20 @@ class RedisQueue {
     return { ok: true }
   }
 
+  async moveToDLQ(jobId, workerId, error) {
+    const pipeline = this.redis.pipeline();
+    pipeline.hset(this.keys.job(jobId), {
+      status: 'dlq',
+      failedAt: Date.now(),
+      failureReason: error,
+    })
+
+    pipeline.zrem(this.keys.queue, jobId)
+    pipeline.rpush(this.keys.dlq, jobId)
+
+    await pipeline.exec();
+  }
+
   async extendLease(jobId, workerId) {
     const res = await this.redis.eval(
       extendLeaseScript,
@@ -120,11 +134,15 @@ class RedisQueue {
     )
 
     if (res[0] == 'ERROR') {
-      console.log('Lease error:', res)
-      return false
+      return { ok: false, error: res }
     }
 
-    return true
+    return { ok: true }
+  }
+
+  async addError(jobId, error) {
+    await this.redis.rpush(this.keys.errors(jobId), error);
+    await this.redis.hset(this.keys.job(jobId), 'lastError', error);
   }
 
   async isIdle() {

@@ -4,7 +4,7 @@ import Job from './job.js';
 const queue = new RedisQueue();
 
 async function createJobs() {
-    for (let i = 1; i <= 20; i++) {
+    for (let i = 1; i <= 50; i++) {
         const job = Job.from({
             id: i,
             description: `Task number ${i}`,

@@ -48,7 +48,7 @@ class Job {
   }
 
   perform() {
-    if (Math.random() < 0.7) {
+    if (Math.random() < 0.3) {
       throw new Error('Failure');
     }
   }

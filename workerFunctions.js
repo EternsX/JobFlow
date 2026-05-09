@@ -1,4 +1,4 @@
-export function workerLoopSwitch(res, POLL_INTERVAL, delay) {
+export async function workerLoopSwitch(res, POLL_INTERVAL, delay) {
     switch (res.type) {
         case 'RATE_LIMIT':
         case 'NO_JOBS':

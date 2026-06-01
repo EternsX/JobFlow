@@ -1,7 +1,6 @@
 class Job {
-  constructor({ id, description, priority = 0, tries = 0, maxTries = 3 }) {
+  constructor({ id, priority = 0, tries = 0, maxTries = 3 }) {
     this.id = id;
-    this.description = description;
     this.priority = priority;
     this.tries = tries;
     this.maxTries = maxTries;
@@ -22,7 +21,6 @@ class Job {
 
   validate() {
     if (!this.id) throw new Error('Job must have an id');
-    if (!this.description) throw new Error('Job must have a description');
     if (this.maxTries <= 0) throw new Error('maxTries must be > 0');
   }
 

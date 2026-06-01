@@ -1,6 +1,18 @@
 {
+  "name": "job-flow",
+  "version": "1.0.0",
+  "description": "Reusable email worker for sending emails",
   "dependencies": {
-    "ioredis": "^5.10.1"
+    "dotenv": "^17.4.2",
+    "ioredis": "^5.10.1",
+    "resend": "^6.12.3"
   },
-  "type": "module"
+  "keywords": [
+    "email",
+    "worker",
+    "node"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js"
 }

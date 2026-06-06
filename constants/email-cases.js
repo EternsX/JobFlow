@@ -1,4 +1,4 @@
-EMAIL_CASES = {
+const EMAIL_CASES = {
     "password_reset": (content) => 
         `
         <h1>Reset your password</h1>

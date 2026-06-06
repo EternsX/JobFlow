@@ -1,8 +1,5 @@
 import Job from './job.js';
-import { Resend } from 'resend';
 import EMAIL_CASES from './constants/email-cases.js';
-
-const resend = new Resend(process.env.RESEND_API_KEY);
 
 class SendEmailJob extends Job {
   constructor(from, to, subject, type, content) {
@@ -21,7 +18,6 @@ class SendEmailJob extends Job {
       subject: this.subject,
       html: this.renderEmail(this.type, this.content),
     });
-
   }
 
   renderEmail(type, content) {
@@ -44,3 +40,5 @@ class SendEmailJob extends Job {
 //     console.error('Failed to send email:', result.error);
 //   }
 // });
+
+export default SendEmailJob;

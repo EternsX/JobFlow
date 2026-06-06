@@ -1,4 +1,5 @@
-import RedisQueue from "./redisQueue";
+import RedisQueue from "./redisQueue.js";
+import SendEmailJob from "./emailJob.js";
 
 class JobFlow {
     constructor() {
@@ -20,3 +21,5 @@ class JobFlow {
         this.queue.addJob(job);
     }
 }
+
+export default JobFlow;

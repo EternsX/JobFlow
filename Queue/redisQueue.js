@@ -1,6 +1,6 @@
 import Redis from "ioredis";
 import { nextJobScript, markDoneScript, extendLeaseScript } from "./luaScripts.js";
-import { PRIORITY_FACTOR, EXPIRE_MS, LEASE_MS, states } from "./constants.js";
+import { PRIORITY_FACTOR, EXPIRE_MS, LEASE_MS, states } from "../constants/constants.js";
 
 class RedisQueue {
   constructor() {
@@ -28,6 +28,7 @@ class RedisQueue {
 
     pipeline.zadd(this.keys.queue, score, job.id);
     pipeline.hset(this.keys.job(job.id), {
+      ...job,
       id: job.id,
       description: job.description,
       priority: job.priority,

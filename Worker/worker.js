@@ -1,7 +1,7 @@
-import Job from "./job.js";
-import RedisQueue from './redisQueue.js'
-import { workerLoopSwitch } from "./workerFunctions.js";
-import { POLL_INTERVAL, HEARTBEAT_INTERVAL, states } from "./constants.js";
+import Job from "../Job/job.js";
+import RedisQueue from '../Queue/redisQueue.js'
+import { workerLoopSwitch, createJobFrom } from "./workerFunctions.js";
+import { POLL_INTERVAL, HEARTBEAT_INTERVAL, states } from "../constants/constants.js";
 
 const delay = (ms) => {
   return new Promise((r) => setTimeout(r, ms));
@@ -98,7 +98,7 @@ class Worker {
 
         const rawJob = res.rawJob;
 
-        const job = Job.from(rawJob);
+        const job = createJobFrom(rawJob);
         const result = await this.processJob(job, workerId);
       } catch (err) {
         console.error(`Worker ${workerId} encountered an error:`, err);
@@ -150,7 +150,7 @@ class Worker {
     this.heartbeats.set(jobId, interval);
   }
 
-  async stopHeartbeat(jobId) {
+  stopHeartbeat(jobId) {
     const interval = this.heartbeats.get(jobId);
 
     if (interval) {

@@ -4,6 +4,7 @@ class Job {
     this.priority = priority;
     this.tries = tries;
     this.maxTries = maxTries;
+    this.jobType = 'job';
   }
 
   static from(raw) {
@@ -58,6 +59,7 @@ class Job {
       priority: this.priority,
       tries: this.tries,
       maxTries: this.maxTries,
+      type: this.type
     };
   }
 }

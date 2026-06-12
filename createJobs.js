@@ -1,5 +1,5 @@
-import RedisQueue from './redisQueue.js';
-import Job from './job.js';
+import RedisQueue from './Queue/redisQueue.js';
+import Job from './Job/job.js';
 
 const queue = new RedisQueue();
 
